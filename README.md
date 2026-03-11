@@ -23,7 +23,9 @@ An edge-AI bird detection and deterrent system running on a Raspberry Pi Zero 2 
 | Raspberry Pi Zero 2 W | Main compute — runs inference, audio processing, MQTT |
 | Raspberry Pi Pico W (on RoboPico board) | Microcontroller — drives servos and laser via PWM/GPIO |
 | ReSpeaker 2-Mic Pi HAT | Dual-channel audio for bird sound detection and bearing estimation |
+| USB Hub | Hub for all USB connections - Pi Zero 2 W, Pico W, USB Camera | 
 | USB Camera | Visual input for YOLO inference |
+| Micro USB to USB 2.0 OTG Adapter  | Adapter for Pi Zero 2's USB In to USB Hub |
 | Pan servo | Horizontal turret rotation |
 | Tilt servo | Vertical turret rotation |
 | Laser module | Bird deterrent |
@@ -84,9 +86,17 @@ Wire colours follow the standard servo convention:
 
 Stacks directly onto the Pi Zero 2 W 40-pin header. No additional wiring required.
 
-### Pico W ↔ Pi Zero 2 W
+### Pi Zero 2 W ↔ USB Hub 
 
-Connect the Pico W (on the RoboPico board) to any USB port on the Pi Zero 2 W. The Pi communicates with the Pico over USB serial at 115200 baud. A udev symlink (`/dev/pico_turret`) is created during setup to give it a stable device path.
+Connect the USB Hub to the USB In of the Pico W. This will be the main interface for all other USB components.
+
+### USB Hub ← Pico W
+
+Connect the Pico W (on the RoboPico board) to any USB port on the hub. The Pi communicates with the Pico over USB serial at 115200 baud. A udev symlink (`/dev/pico_turret`) is created during setup to give it a stable device path.
+
+### USB Hub ← USB Camera
+
+Connect the USB Camera to any USB port on the hub. A udev symlink (`/dev/birdguard_cam`) is created during setup to give it a stable device path.
 
 ---
 
