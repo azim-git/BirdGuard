@@ -133,28 +133,98 @@ sudo apt update && sudo apt upgrade -y
 
 ```bash
 sudo apt install -y \
-  python3-pip python3-venv python3-opencv python3-numpy \
+  python3-pip python3-venv python3-numpy \
   python3-pyaudio alsa-utils python3-dev libasound2-dev git \
   mosquitto mosquitto-clients time linux-perf sysstat
 ```
 
-### 3.4 Install Python Packages
+### 3.4 Install Python 3.11 via pyenv (required for TFLite runtime)
+
+The TFLite runtime requires Python 3.11, which is not available in the default Raspberry Pi OS repositories. Use **pyenv** to install and manage it.
+
+#### 3.4.1 Install pyenv
 
 ```bash
-pip install flask --break-system-packages
-pip install pyserial --break-system-packages
-pip3 install pyalsaaudio --break-system-packages
-pip install onnxruntime --break-system-packages
-pip install paho-mqtt --break-system-packages
+curl https://pyenv.run | bash
 ```
 
-### 3.5 Stable Device Paths (udev Rules)
+#### 3.4.2 Configure shell environment
+
+Add the following lines to the bottom of both `~/.bashrc` and `~/.profile`:
+
+```bash
+nano ~/.bashrc
+```
+
+```bash
+nano ~/.profile
+```
+
+Add these lines to both files:
+
+```bash
+export PYENV_ROOT="$HOME/.pyenv"
+[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init - bash)"
+eval "$(pyenv virtualenv-init -)"
+```
+
+Reload the shell:
+
+```bash
+source ~/.bashrc
+```
+
+#### 3.4.3 Install Python build dependencies
+
+```bash
+sudo apt install -y \
+  libssl-dev libbz2-dev libreadline-dev \
+  libffi-dev libncurses-dev
+```
+
+#### 3.4.4 Install Python 3.11.9
+
+```bash
+pyenv install 3.11.9
+```
+
+> This compiles Python from source and takes approximately 20 minutes on the Pi Zero 2 W.
+
+Set it as the default:
+
+```bash
+pyenv global 3.11.9
+```
+
+Verify:
+
+```bash
+python --version
+# Should show: Python 3.11.9
+```
+
+### 3.5 Install Python Packages
+
+```bash
+pip install tflite-runtime
+pip install flask
+pip install pyserial
+pip install pyalsaaudio
+pip install onnxruntime
+pip install paho-mqtt
+pip install "numpy<2"
+pip install opencv-python-headless
+pip install psutil
+```
+
+### 3.6 Stable Device Paths (udev Rules)
 
 First, confirm the hardware attributes of your Pico and camera:
 
 ```bash
 udevadm info -a -n /dev/ttyACM0 | grep -E 'idVendor|idProduct|serial' | head
-udevadm info -a -n /dev/video0  | grep -E 'idVendor|idProduct|serial'
+udevadm info --query=all /dev/video0 | grep -E 'ID_VENDOR_ID|ID_MODEL_ID'
 ```
 
 Create the udev rules files:
@@ -173,11 +243,13 @@ SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0005", SYMLINK+="p
 sudo nano /etc/udev/rules.d/99-birdguard-cam.rules
 ```
 
-Add (replace values with those confirmed above):
+Add (replace vendor/product IDs with those confirmed above):
 
 ```
-SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1234", ATTRS{idProduct}=="5678", SYMLINK+="birdguard_cam", TAG+="systemd"
+SUBSYSTEM=="video4linux", ATTR{index}=="0", ATTRS{idVendor}=="1234", ATTRS{idProduct}=="5678", SYMLINK+="birdguard_cam", TAG+="systemd"
 ```
+
+> **Important:** The `ATTR{index}=="0"` filter ensures the symlink points to the video capture node, not the metadata node. USB cameras register two `/dev/video` devices — only index 0 can capture frames.
 
 Reload and verify:
 
@@ -189,7 +261,7 @@ ls -l /dev/pico_turret
 ls -l /dev/birdguard_cam
 ```
 
-### 3.6 ReSpeaker 2-Mic HAT Driver
+### 3.7 ReSpeaker 2-Mic HAT Driver
 
 **Stack the ReSpeaker HAT onto the Pi Zero 2 W before proceeding.**
 
@@ -209,7 +281,7 @@ arecord -l
 # Should list: seeed2micvoicec
 ```
 
-### 3.7 Enable I2S in Firmware Config
+### 3.8 Enable I2S in Firmware Config
 
 ```bash
 sudo nano /boot/firmware/config.txt
@@ -231,7 +303,7 @@ dtparam=i2s=on
 sudo reboot
 ```
 
-### 3.8 Configure Audio Mixer
+### 3.9 Configure Audio Mixer
 
 After rebooting, SSH back in and run:
 
@@ -253,7 +325,7 @@ arecord -D hw:0,0 -f S16_LE -r 44100 -c 2 -d 5 test.wav
 aplay -D hw:0,0 test.wav
 ```
 
-### 3.9 MQTT Broker Setup
+### 3.10 MQTT Broker Setup
 
 Enable Mosquitto to start on boot:
 
@@ -280,7 +352,7 @@ Restart the broker:
 sudo systemctl restart mosquitto
 ```
 
-### 3.10 Copy BirdGuard to the Pi
+### 3.11 Copy BirdGuard to the Pi
 
 From your laptop/desktop:
 
@@ -595,7 +667,9 @@ All messages are JSON and include `timestamp` (Unix epoch float) and `event` fie
 |---|---|
 | `arecord -l` shows no seeed card | Check `dtoverlay=wm8960-soundcard` is in `/boot/firmware/config.txt` and reboot |
 | `/dev/pico_turret` missing | Verify the udev rule's `idVendor`/`idProduct` match the output of `udevadm info` for your Pico |
-| `/dev/birdguard_cam` missing | Same as above for the camera |
+| `/dev/birdguard_cam` missing | Same as above for the camera. Ensure `ATTR{index}=="0"` is in the rule |
+| `/dev/birdguard_cam` exists but camera fails | The symlink may point to the metadata node (video1) instead of the capture node (video0). Re-check the udev rule includes `ATTR{index}=="0"` |
 | Turret spasms during patrol | `patrol_pan_min` is higher than `patrol_pan_max` — correct via MQTT `birdguard/mode` |
 | Audio triggers too easily | Raise `energy_threshold` via MQTT (try 600–1000); servo movement noise can self-trigger at low values |
-| Inference is too slow | Reduce `input_size` to 320/256 in config & use the appropriate yolo model with the same input dimensions|
+| Inference is too slow | Reduce `input_size` to 320/256 in config & use the appropriate yolo model with the same input dimensions |
+| `python --version` shows wrong version | Run `source ~/.bashrc` then `pyenv global 3.11.9` |
