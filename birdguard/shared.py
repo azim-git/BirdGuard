@@ -46,7 +46,7 @@ class Config:
     sample_rate: int = 16000
     audio_channels: int = 2
     audio_chunk: int = 1024
-    audio_cooldown: float = 2.0
+    audio_cooldown: float = 1.0
     energy_threshold: float = 500.0
     mic_spacing_m: float = 0.058
     speed_of_sound: float = 343.0
@@ -58,7 +58,8 @@ class Config:
     cam_capture_h: int = 720
 
     # ---- Model ----------------------------------------------------------
-    model_path: str = "yolov8s.onnx"
+    model_path: str = "yolov8n_float16.tflite"
+    use_tflite: bool = True
     confidence_threshold: float = 0.1
     nms_iou_threshold: float = 0.50
     bird_class_id: int = 14

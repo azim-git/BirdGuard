@@ -41,6 +41,11 @@ except ImportError:
     ort = None
 
 try:
+    import tflite_runtime.interpreter as tflite
+except ImportError:
+    tflite = None
+
+try:
     import alsaaudio
 except ImportError:
     alsaaudio = None
@@ -241,6 +246,8 @@ class SnapshotWorker(threading.Thread):
         self._frame_grabber = frame_grabber
         self.session = None
         self.inp_name = None
+        self.inp_details = None
+        self.out_details = None
         self._last_pass_ms = 4000.0
 
     def run(self):
@@ -261,7 +268,7 @@ class SnapshotWorker(threading.Thread):
             # Update stream overlay (snapshot-driven in smart patrol)
             if shared.stream_enabled and result.frame is not None:
                 with state_lock:
-                    st = current_state
+                    st = shared.current_state  # read from module, not stale import
                 best_idx = -1
                 if result.dets:
                     best_idx = max(range(len(result.dets)),
@@ -293,7 +300,11 @@ class SnapshotWorker(threading.Thread):
         # Get the latest frame from the background FrameGrabber.
         # This is nearly instant (~0 ms) compared to the old approach
         # of draining 5 stale USB frames (~680 ms).
+        #t_grab_start = time.perf_counter()
         frame, age_ms = self._frame_grabber.get_frame()
+        #t_grab_end = time.perf_counter()
+        #grab_ms = (t_grab_end - t_grab_start) * 1000
+        #log.info("FrameGrabber.get_frame(): %.2f ms (frame age: %.1f ms)", grab_ms, age_ms if age_ms >= 0 else -1)
         with turret_pos_lock:
             cap_pan = turret_pos["pan"]
             cap_tilt = turret_pos["tilt"]
@@ -381,19 +392,29 @@ class SnapshotWorker(threading.Thread):
         return all_dets
 
     def _run_inference_on_region(self, region, x_offset_px, y_offset_px,
-                                 orig_w, orig_h):
+                                orig_w, orig_h):
         global measured_pass_s
         img, scale, pad_x, pad_y = letterbox(region, CFG.input_size)
-        blob = np.expand_dims(
-            np.transpose(img.astype(np.float32) / 255.0, (2, 0, 1)), 0)
+        rh, rw = region.shape[:2]
 
         t_pass = time.perf_counter()
-        outputs = self.session.run(None, {self.inp_name: blob})
+
+        if CFG.use_tflite:
+            # TFLite expects NHWC float32
+            blob = np.expand_dims(img.astype(np.float32) / 255.0, 0)
+            self.session.set_tensor(self.inp_details[0]['index'], blob)
+            self.session.invoke()
+            outputs = [self.session.get_tensor(self.out_details[0]['index'])]
+        else:
+            # ONNX expects NCHW float32
+            blob = np.expand_dims(
+                np.transpose(img.astype(np.float32) / 255.0, (2, 0, 1)), 0)
+            outputs = self.session.run(None, {self.inp_name: blob})
+
         pass_ms = (time.perf_counter() - t_pass) * 1000
         self._last_pass_ms = pass_ms
         measured_pass_s = pass_ms / 1000.0
 
-        rh, rw = region.shape[:2]
         dets = self._postprocess(outputs, scale, pad_x, pad_y, rw, rh)
 
         for d in dets:
@@ -431,22 +452,39 @@ class SnapshotWorker(threading.Thread):
         return merged
 
     def _load_model(self):
-        if ort is None:
-            log.error("onnxruntime not available")
-            return
-        try:
-            opts = ort.SessionOptions()
-            opts.intra_op_num_threads = 3
-            opts.inter_op_num_threads = 1
-            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            self.session = ort.InferenceSession(
-                CFG.model_path, sess_options=opts,
-                providers=["CPUExecutionProvider"])
-            self.inp_name = self.session.get_inputs()[0].name
-            log.info("Model loaded: %s (input %dx%d)",
-                     CFG.model_path, CFG.input_size, CFG.input_size)
-        except Exception as exc:
-            log.error("Model load failed: %s", exc)
+        if CFG.use_tflite:
+            if tflite is None:
+                log.error("tflite_runtime not available")
+                return
+            try:
+                self.session = tflite.Interpreter(
+                    model_path=CFG.model_path,
+                    num_threads=3)
+                self.session.allocate_tensors()
+                self.inp_details = self.session.get_input_details()
+                self.out_details = self.session.get_output_details()
+                self.inp_name = None  # not used for TFLite
+                log.info("TFLite model loaded: %s", CFG.model_path)
+            except Exception as exc:
+                log.error("TFLite model load failed: %s", exc)
+        else:
+            if ort is None:
+                log.error("onnxruntime not available")
+                return
+            try:
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = 3
+                opts.inter_op_num_threads = 1
+                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                self.session = ort.InferenceSession(
+                    CFG.model_path, sess_options=opts,
+                    providers=["CPUExecutionProvider"])
+                self.inp_name = self.session.get_inputs()[0].name
+                self.inp_details = None
+                self.out_details = None
+                log.info("ONNX model loaded: %s", CFG.model_path)
+            except Exception as exc:
+                log.error("ONNX model load failed: %s", exc)
 
     def _postprocess(self, outputs, scale, pad_x, pad_y, orig_w, orig_h):
         preds = outputs[0]
@@ -471,10 +509,26 @@ class SnapshotWorker(threading.Thread):
 
         bird = bird[mask]
         bx = boxes[:, mask]
-        cx = (bx[0] - pad_x) / scale
-        cy = (bx[1] - pad_y) / scale
-        w = bx[2] / scale
-        h = bx[3] / scale
+
+        # YOLOv8 box format: [cx, cy, w, h]
+        # ONNX exports give pixel coords in input space (0 to input_size).
+        # Some TFLite exports give normalised coords (0 to 1).
+        # Detect which format by checking if max box coord is <= 1.0.
+        raw_cx, raw_cy, raw_w, raw_h = bx[0], bx[1], bx[2], bx[3]
+        max_coord = float(max(np.max(np.abs(raw_cx)), np.max(np.abs(raw_cy)),
+                              np.max(raw_w), np.max(raw_h)))
+        if max_coord <= 1.0:
+            # Normalised coords (0-1) — scale to input pixel space first
+            raw_cx = raw_cx * CFG.input_size
+            raw_cy = raw_cy * CFG.input_size
+            raw_w = raw_w * CFG.input_size
+            raw_h = raw_h * CFG.input_size
+
+        # Remove letterbox padding and convert to region pixel space
+        cx = (raw_cx - pad_x) / scale
+        cy = (raw_cy - pad_y) / scale
+        w = raw_w / scale
+        h = raw_h / scale
 
         nms_boxes = np.stack([cx - w/2, cy - h/2, w, h], axis=1).tolist()
         indices = cv2.dnn.NMSBoxes(nms_boxes, bird.tolist(),
@@ -639,11 +693,10 @@ class SmartPatrolMode(ModeBase):
     def _settle_snapshot_or_audio(self, settle_time: float):
         time.sleep(settle_time)
         turret_moving.clear()
-        while not audio_queue.empty():
-            try:
-                audio_queue.get_nowait()
-            except queue.Empty:
-                break
+        # Don't drain the audio queue here — the turret has already
+        # settled, so any audio events in the queue are real environmental
+        # sounds, not servo noise.  Let _wait_for_result_or_audio pick
+        # them up so they can trigger a state transition.
         self._request_snapshot()
         return self._wait_for_result_or_audio()
 
@@ -682,14 +735,31 @@ class SmartPatrolMode(ModeBase):
             self.cur_pan = pan
             self.cur_tilt = CFG.smart_patrol_tilt
 
-            # Settle: wait for servo vibration to stop before snapshot
-            time.sleep(CFG.snapshot_settle)
-            turret_moving.clear()
+            # Settle: wait for servo vibration to stop before snapshot.
+            # Drain audio events that arrived DURING the move (servo noise)
+            # but do this BEFORE the settle sleep so that real audio events
+            # arriving after the turret has stopped are preserved.
             while not audio_queue.empty():
                 try:
                     audio_queue.get_nowait()
                 except queue.Empty:
                     break
+
+            time.sleep(CFG.snapshot_settle)
+            turret_moving.clear()
+
+            # Check if a real audio event arrived during settle (turret was
+            # already stationary, so this is genuine environmental sound)
+            try:
+                early_audio = audio_queue.get_nowait()
+                log.info("Audio wake during settle - RMS %.0f  bearing %.1f",
+                         early_audio.rms_energy, early_audio.bearing_deg)
+                self.cur_pan = early_audio.bearing_deg
+                self._patrol_direction *= -1
+                self._set_state(State.SCANNING)
+                return
+            except queue.Empty:
+                pass
 
             self._request_snapshot()
             result, audio_evt = self._wait_for_result_or_audio()
@@ -776,6 +846,9 @@ class SmartPatrolMode(ModeBase):
 
     def _refine_and_track(self, result):
         target_pan = result.capture_pan + (-result.offset_x * CFG.cam_hfov_deg)
+        # offset_y > 0 means bird is below centre → tilt must increase (down)
+        # offset_y < 0 means bird is above centre → tilt must decrease (up)
+        # ADD because tilt increases downward on this hardware (0=up, 180=down)
         target_tilt = result.capture_tilt + (result.offset_y * CFG.cam_vfov_deg)
         self.cur_pan = clamp(target_pan, CFG.pan_min, CFG.pan_max)
         self.cur_tilt = clamp(target_tilt, CFG.tilt_min, CFG.tilt_max)

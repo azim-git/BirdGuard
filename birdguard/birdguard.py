@@ -191,6 +191,32 @@ class ModeManager:
         with shared.camera_healthy_lock:
             cam_ok = shared.camera_healthy
 
+        # Active probe: in Patrol/Manual modes FrameGrabber doesn't run,
+        # so camera_healthy is never updated.  Probe the VideoCapture
+        # directly to detect disconnects.
+        if cam_ok and self._active_mode_enum != Mode.SMART_PATROL:
+            with shared_camera_lock:
+                if shared.shared_camera is None or not shared.shared_camera.isOpened():
+                    cam_ok = False
+                    with shared.camera_healthy_lock:
+                        shared.camera_healthy = False
+                    log.error("HEALTH: Camera lost (device closed/missing)")
+                else:
+                    # Quick non-blocking grab test — if the device handle
+                    # is open but USB is gone, grab() returns False
+                    ok = shared.shared_camera.grab()
+                    if not ok:
+                        self._cam_probe_fails = getattr(
+                            self, '_cam_probe_fails', 0) + 1
+                        if self._cam_probe_fails >= 3:
+                            cam_ok = False
+                            with shared.camera_healthy_lock:
+                                shared.camera_healthy = False
+                            log.error("HEALTH: Camera lost (grab failed "
+                                      "%d times)", self._cam_probe_fails)
+                    else:
+                        self._cam_probe_fails = 0
+
         if not cam_ok and self._camera_was_healthy:
             # Camera just went down
             log.error("HEALTH: Camera lost")
@@ -259,11 +285,12 @@ class ModeManager:
     def _try_reopen_camera(self):
         """Attempt to reopen the camera after USB disconnect/reconnect.
 
-        The old VideoCapture is dead after disconnect — OpenCV doesn't
-        auto-reconnect. Release it, open fresh on the udev symlink.
+        Tries multiple strategies since USB cameras can re-enumerate to
+        different /dev/videoN nodes, and udev symlinks may point to the
+        wrong node (metadata vs capture interface).
         """
         import shared
-        log.info("HEALTH: Attempting camera reopen on %s", CFG.camera_device)
+        log.info("HEALTH: Attempting camera reopen")
         with shared_camera_lock:
             if shared.shared_camera is not None:
                 try:
@@ -272,23 +299,14 @@ class ModeManager:
                     pass
                 shared.shared_camera = None
 
-            try:
-                cap = cv2.VideoCapture(CFG.camera_device)
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CFG.cam_capture_w)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.cam_capture_h)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                if cap.isOpened():
-                    for _ in range(10):
-                        cap.grab()
-                    shared.shared_camera = cap
-                    with shared.camera_healthy_lock:
-                        shared.camera_healthy = True
-                    log.info("HEALTH: Camera reopened successfully")
-                else:
-                    log.warning("HEALTH: Camera not available yet")
-                    cap.release()
-            except Exception as exc:
-                log.warning("HEALTH: Camera reopen error: %s", exc)
+            cap = _find_working_camera()
+            if cap is not None:
+                shared.shared_camera = cap
+                with shared.camera_healthy_lock:
+                    shared.camera_healthy = True
+                log.info("HEALTH: Camera reopened successfully")
+            else:
+                log.warning("HEALTH: No working camera found")
 
     def forward_mode_command(self, cmd: str, payload: dict):
         """Forward a mode-specific command to the active mode."""
@@ -625,28 +643,120 @@ mqtt_mgr: Optional[MQTTManager] = None
 
 # ========================== SHARED CAMERA ===================================
 
-def open_shared_camera():
-    """Open the shared camera instance used by all modes."""
-    import shared
-    with shared_camera_lock:
-        if shared.shared_camera is not None and shared.shared_camera.isOpened():
-            return True
+def _find_working_camera():
+    """Find and open the first working USB camera.
+
+    USB cameras register two V4L2 nodes: one for video capture (the one
+    we need) and one for metadata (which can't capture frames). The udev
+    symlink may point to either one. Additionally, after USB reconnect
+    the device may re-enumerate to a different /dev/videoN.
+
+    Strategy: try the configured device first, then fall back to scanning
+    all /dev/videoN nodes for a USB camera that can actually produce frames.
+    Skip bcm2835 (Pi GPU) devices.
+
+    Returns an opened, verified cv2.VideoCapture or None.
+    """
+    candidates = []
+
+    # Priority 1: configured device (symlink or path)
+    if os.path.exists(CFG.camera_device):
+        real = os.path.realpath(CFG.camera_device)
+        candidates.append(("config", real))
+
+    # Priority 2: resolved symlink target (in case OpenCV can't follow symlinks)
+    if os.path.islink(CFG.camera_device):
+        real = os.path.realpath(CFG.camera_device)
+        if ("config", real) not in candidates:
+            candidates.append(("symlink-resolved", real))
+
+    # Priority 3: scan /dev/video* for USB cameras (skip Pi GPU devices)
+    try:
+        video_devs = sorted(
+            [f"/dev/{f}" for f in os.listdir("/dev") if f.startswith("video")],
+            key=lambda p: int(p.replace("/dev/video", "")) if p.replace("/dev/video", "").isdigit() else 999
+        )
+    except OSError:
+        video_devs = []
+
+    for dev_path in video_devs:
+        # Quick filter: check if this is a USB camera via v4l2 sysfs
+        # bcm2835 devices have index numbers >= 10 on Pi
+        dev_name = os.path.basename(dev_path)
+        dev_num = dev_name.replace("video", "")
+        if not dev_num.isdigit():
+            continue
+        num = int(dev_num)
+        # bcm2835 devices are typically video10+; USB cameras are video0-video9
+        if num >= 10:
+            continue
+        label = f"scan-{dev_path}"
+        if not any(c[1] == dev_path for c in candidates):
+            candidates.append((label, dev_path))
+
+    # Priority 4: integer index 0 (OpenCV's own device enumeration)
+    candidates.append(("index-0", 0))
+
+    for label, device in candidates:
         try:
-            cap = cv2.VideoCapture(CFG.camera_device)
+            cap = cv2.VideoCapture(device)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, CFG.cam_capture_w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.cam_capture_h)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            if cap.isOpened():
-                shared.shared_camera = cap
-                log.info("Shared camera opened (%dx%d)",
-                         CFG.cam_capture_w, CFG.cam_capture_h)
-                return True
+
+            # Drain stale buffer
+            for _ in range(5):
+                cap.grab()
+
+            # Verify actual frame capture
+            ret, test_frame = cap.read()
+            if ret and test_frame is not None:
+                log.info("Camera found via %s (%s) — %dx%d",
+                         label, device, test_frame.shape[1], test_frame.shape[0])
+                return cap
             else:
-                log.error("Failed to open camera: %s", CFG.camera_device)
-                return False
-        except Exception as exc:
-            log.error("Camera error: %s", exc)
-            return False
+                cap.release()
+        except Exception:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+    return None
+
+
+def open_shared_camera():
+    """Open the shared camera instance used by all modes.
+
+    Retries at startup because after reboot the USB camera may appear
+    in /dev before its firmware is ready to stream.
+    """
+    import shared
+    max_attempts = 5
+
+    with shared_camera_lock:
+        if shared.shared_camera is not None and shared.shared_camera.isOpened():
+            return True
+
+    for attempt in range(1, max_attempts + 1):
+        with shared_camera_lock:
+            cap = _find_working_camera()
+            if cap is not None:
+                shared.shared_camera = cap
+                return True
+
+        log.warning("Camera open attempt %d/%d failed", attempt, max_attempts)
+        if attempt < max_attempts:
+            time.sleep(2.0)
+
+    log.error("Failed to open camera after %d attempts", max_attempts)
+    with shared.camera_healthy_lock:
+        shared.camera_healthy = False
+    return False
 
 
 def close_shared_camera():
