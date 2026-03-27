@@ -13,6 +13,8 @@ An edge-AI bird detection and deterrent system running on a Raspberry Pi Zero 2 
 5. [YOLO Model Setup](#5-yolo-model-setup)
 6. [Running BirdGuard](#6-running-birdguard)
 7. [MQTT Reference](#7-mqtt-reference)
+8. [Design Justifications](#8-design-justifications)
+9. [Task Distribution](#9-task-distribution)
 
 ---
 
@@ -23,9 +25,9 @@ An edge-AI bird detection and deterrent system running on a Raspberry Pi Zero 2 
 | Raspberry Pi Zero 2 W | Main compute — runs inference, audio processing, MQTT |
 | Raspberry Pi Pico W (on RoboPico board) | Microcontroller — drives servos and laser via PWM/GPIO |
 | ReSpeaker 2-Mic Pi HAT | Dual-channel audio for bird sound detection and bearing estimation |
-| USB Hub | Hub for all USB connections - Pi Zero 2 W, Pico W, USB Camera | 
+| USB Hub | Hub for all USB connections - Pi Zero 2 W, Pico W, USB Camera |
 | USB Camera | Visual input for YOLO inference |
-| Micro USB to USB 2.0 OTG Adapter  | Adapter for Pi Zero 2's USB In to USB Hub |
+| Micro USB to USB 2.0 OTG Adapter | Adapter for Pi Zero 2's USB In to USB Hub |
 | Pan servo | Horizontal turret rotation |
 | Tilt servo | Vertical turret rotation |
 | Laser module | Bird deterrent |
@@ -86,7 +88,7 @@ Wire colours follow the standard servo convention:
 
 Stacks directly onto the Pi Zero 2 W 40-pin header. No additional wiring required.
 
-### Pi Zero 2 W ↔ USB Hub 
+### Pi Zero 2 W ↔ USB Hub
 
 Connect the USB Hub to the USB In of the Pico W. This will be the main interface for all other USB components.
 
@@ -658,6 +660,259 @@ All messages are JSON and include `timestamp` (Unix epoch float) and `event` fie
 | `health_alert` | Component failure or recovery | `component`, `status`, `detail` |
 | `restarting` | Restart command received | — |
 | `shutting_down` | Shutdown command received | — |
+
+---
+
+## 8. Design Justifications
+
+This section documents the rationale behind every major hardware, software, model, and architectural decision in BirdGuard, and why each was chosen over the alternatives considered.
+
+### 8.1 Hardware Justifications
+
+#### 8.1.1 Raspberry Pi Zero 2 W — Main Compute Board
+
+The Pi Zero 2 W was selected as the perception and decision node. Its quad-core Cortex-A53 at 1 GHz with 512 MB RAM provides sufficient compute for INT8/FP16 model inference while drawing only ~1.5 W. This low power envelope is critical for the target deployment scenarios (solar-powered field installations, rooftop arrays, airfield perimeters) where sustained power budgets of under 5 W are required.
+
+The primary alternative considered was the Raspberry Pi 5 (quad Cortex-A76 @ 2.4 GHz, 4–8 GB RAM). While the Pi 5 would complete inference faster, the additional speed is unnecessary — the Pi Zero 2 already fits within the latency budget. The Pi 5 draws 5–10 W (3–7× more), has a larger 85×56 mm footprint that complicates turret integration, and costs 4–5× more. In edge system design, the correct platform is the one that meets requirements with the smallest resource footprint, not the most powerful available.
+
+The 40-pin GPIO header enables direct stacking of the ReSpeaker HAT via I2S, eliminating the need for a USB audio device and keeping the audio path low-latency.
+
+#### 8.1.2 Raspberry Pi Pico W on RoboPico Board — Actuator Controller
+
+Servo PWM requires microsecond-level timing precision. Linux on the Pi Zero 2 is not a real-time operating system and cannot guarantee jitter-free GPIO — the kernel scheduler introduces unpredictable delays that cause servo jitter under CPU load. The Pico W running MicroPython on bare metal (RP2040, dual Cortex-M0+ @ 133 MHz) provides deterministic PWM output with command-to-movement latency typically under 10 ms.
+
+The RoboPico carrier board was specifically chosen because it provides built-in servo headers and power regulation, eliminating external wiring, breadboarding, and a separate servo driver board. This reduces assembly complexity and potential failure points in an outdoor deployment.
+
+The alternative considered was the Arduino Nano 33 IoT (SAMD21, single Cortex-M0+ @ 48 MHz). It is a capable MCU but offers a slower single core, no carrier board for easy servo integration, and costs ~$20 vs ~$6 for the Pico W. The RP2040's dual cores and higher clock also provide headroom for future firmware expansion.
+
+Communication between the Pi Zero 2 and Pico W uses USB serial (CDC ACM class) at 115200 baud with a simple text protocol (`PAN<deg>,TILT<deg>,LASER<0|1>\n`). This is a local USB connection — not a network socket — so it is unaffected by Wi-Fi or internet connectivity. The Pico W has no autonomous behaviour; it is a deterministic actuator that executes exactly what it is told. If the serial link fails, the turret holds its last position and the Pi Zero 2 detects the failure.
+
+#### 8.1.3 ReSpeaker 2-Mic Pi HAT v1.0 — Audio Input
+
+The ReSpeaker 2-Mic HAT is the only option among those considered that enables direction-of-arrival estimation. Its two digital MEMS microphones in a fixed stereo array allow TDOA (Time Difference of Arrival) cross-correlation to produce a coarse left-right bearing estimate. While the angular resolution is limited by the small 58 mm inter-microphone spacing, a coarse estimate is sufficient — the camera refines the target position in the subsequent visual pipeline stage.
+
+The alternative was a single USB condenser microphone. A mono microphone can detect the presence of sound but cannot estimate direction, leaving the camera to scan blindly. The HAT's I2S interface is also advantageous because it communicates over the 40-pin GPIO header and does not consume a USB port on the already-constrained single-port Pi Zero 2 W. The stacking form factor keeps the assembly compact and mechanically robust.
+
+Audio processing is computationally trivial (short-time energy + GCC-PHAT cross-correlation), consuming negligible CPU, and acts as the system's wake trigger — the rest of the pipeline remains idle during quiet periods, saving power.
+
+#### 8.1.4 USB Camera (HBVCAM W2312 V11)
+
+A USB camera was chosen over the Pi Camera Module (CSI ribbon) for mechanical reasons: the camera is mounted on the moving turret assembly and must rotate with the pan/tilt mechanism. A USB cable can flex freely during turret movement, whereas a CSI ribbon cable is rigid and would be stressed by repeated rotation, eventually failing. The USB interface also allows the camera to be connected through the USB hub alongside the Pico W.
+
+The camera captures at 1280×720 with a narrow 21.8° horizontal / 16.8° vertical field of view. The narrow FOV acts as a natural "zoom" that increases the pixel density on distant targets (2–10 m engagement range), improving detection of small birds without requiring higher resolution or larger models.
+
+#### 8.1.5 Class 1 Laser Module
+
+The laser provides a moving, unpredictable visual stimulus that birds perceive as a predator's eye or a threatening light pattern, without causing physical harm. Class 1 rating ensures eye safety for bystanders. The laser is digitally controlled via a single GPIO pin on the Pico W (active high) and draws current only when activated.
+
+#### 8.1.6 USB Hub
+
+The Pi Zero 2 W has only a single micro-USB OTG port. A USB hub is required to connect both the camera and the Pico W simultaneously. A micro-USB to USB 2.0 OTG adapter bridges the Pi's port to the hub. The hub also powers downstream devices from the shared 5V rail.
+
+### 8.2 Software Justifications
+
+#### 8.2.1 Python 3.11.9 via pyenv
+
+The TFLite runtime requires Python 3.11.x. Raspberry Pi OS ships with Python 3.13, which is incompatible with the `tflite-runtime` package. Rather than downgrading the system Python (which could break OS packages), pyenv was used to install Python 3.11.9 alongside the system Python. This required compiling from source on the Pi Zero 2 W (~20 min), resolving tmpfs space constraints, and pinning NumPy to <2.0 to avoid ABI incompatibilities with the TFLite build.
+
+#### 8.2.2 Threading Architecture (Pi Zero 2 W)
+
+The pipeline on the Pi Zero 2 is divided across dedicated threads pinned to specific responsibilities:
+
+- **AudioMonitor thread** — Continuously captures audio from the ReSpeaker via ALSA, computes short-time energy on each buffer, and performs TDOA cross-correlation when a wake event is detected. Always active during Smart Patrol, lightweight, acts as the system's "ears."
+- **FrameGrabber thread** — Continuously reads frames from the USB camera in the background, keeping a single fresh frame available at all times. This eliminates the ~680 ms cost of draining 5 stale USB-buffered frames on every snapshot.
+- **SnapshotWorker thread** — Waits for snapshot requests, retrieves the latest frame from FrameGrabber (near-instant), runs preprocessing + model inference + postprocessing, and posts results to the visual queue. This is the most CPU-intensive thread.
+- **Decision/State Machine** — The main mode thread reads from shared queues, fuses audio bearings with visual detections, computes servo angles, and sends serial commands. Lightweight arithmetic + serial write.
+
+Thread-safe communication uses `queue.Queue` (bounded, non-blocking) and `threading.Event` flags. A `turret_moving` event suppresses audio processing during servo movements to avoid self-triggering from servo noise.
+
+#### 8.2.3 Multi-Mode Architecture
+
+BirdGuard supports three operating modes, switchable at runtime via MQTT:
+
+- **Smart Patrol** — Full AI pipeline: audio wake → visual inference → deterrent sweep. The original and primary mode.
+- **Regular Patrol** — Continuous left-right sweep with laser on, no inference. Useful as a fallback when camera fails or as a simpler deterrent.
+- **Manual** — User-controlled pan/tilt/laser via MQTT. Used for testing, calibration, and remote operation.
+
+The ModeManager handles lifecycle (start/stop), health monitoring, and graceful degradation. If the camera fails during Smart Patrol, the system automatically falls back to Regular Patrol and emits a telemetry alert. Mode changes to Smart Patrol are blocked while the camera is unhealthy.
+
+#### 8.2.4 MQTT for Configuration and Telemetry
+
+MQTT (Mosquitto broker running locally on the Pi) was chosen for runtime configuration, mode switching, and telemetry because it provides a lightweight pub/sub interface that decouples the control plane from the detection pipeline. All tunable parameters (energy threshold, confidence threshold, deterrent cycles, patrol bounds, etc.) can be updated live without restarting the process, via JSON messages on `birdguard/config`. Config changes are persisted to disk (`~/.birdguard_config.json`) and survive restarts.
+
+MQTT operates over the local Wi-Fi network only. The core detection-to-actuation loop has zero network dependency — MQTT is used only for optional telemetry and user control. Non-blocking publishes with timeouts ensure that network delays or disconnections never stall the real-time pipeline.
+
+#### 8.2.5 MJPEG Web Stream (Flask)
+
+An optional MJPEG stream (served by Flask on port 5000) provides a live camera feed with bounding box overlays, pan/tilt angles, and state information. This is useful for debugging and monitoring but is disabled by default (`--stream` flag) because encoding and serving frames adds CPU overhead. The stream runs in a separate daemon thread and does not affect the inference pipeline's latency.
+
+#### 8.2.6 udev Symlinks for Stable Device Paths
+
+USB devices can re-enumerate to different `/dev/videoN` or `/dev/ttyACMN` nodes across reboots or reconnects. Custom udev rules create stable symlinks (`/dev/birdguard_cam`, `/dev/pico_turret`) based on vendor/product IDs, ensuring the software always finds the correct device. The camera rule includes `ATTR{index}=="0"` to target the video capture node rather than the metadata node — USB cameras register two V4L2 devices, and only index 0 can capture frames.
+
+#### 8.2.7 Health Monitoring and Auto-Recovery
+
+The ModeManager runs periodic health checks (every 500 ms in the main loop) covering:
+
+- **Camera health** — The FrameGrabber tracks consecutive read failures. After 30 failures (~3 seconds), the camera is marked unhealthy. In non-Smart-Patrol modes, an active grab probe detects disconnections. On failure, the system attempts to reopen the camera every 3 seconds, scanning all `/dev/videoN` nodes (since USB re-enumeration may assign a different device number).
+- **Turret health** — The PicoTurret class tracks serial write failures. After two consecutive failures, the turret is marked unhealthy and telemetry alerts are emitted.
+
+All health events are published to `birdguard/telemetry` so external monitoring systems can react.
+
+#### 8.2.8 Graceful Degradation
+
+The system never becomes entirely non-functional in any single-component failure scenario:
+
+| Failure | Behaviour |
+|---|---|
+| Camera disconnected | Smart Patrol falls back to Regular Patrol automatically. User can switch back when camera recovers. |
+| Audio subsystem fails | System continues with camera-only periodic scanning at reduced duty cycle. |
+| Turret serial link lost | Turret holds last position. Pi detects failure and logs it. Actuation resumes on reconnect. |
+| CPU thermal throttling | Visual inference is skipped; system degrades to audio-only aiming with sweep pattern. |
+
+### 8.3 Model Justifications
+
+#### 8.3.1 Model Selection: YOLOv8n (TFLite FP16) as Primary
+
+Two model families were evaluated for the bird detection task, each tested in multiple formats and resolutions on the actual Pi Zero 2 W hardware:
+
+| Model | Format | Input Size | Inference Time (Pi Zero 2) | File Size |
+|---|---|---|---|---|
+| YOLOv8n | TFLite FP16 | 416×416 | ~373 ms | ~12 MB |
+| YOLOv8s | ONNX INT8 | 416×416 | ~1069 ms | ~22 MB |
+| YOLOv8s | ONNX INT8 | 320×320 | ~680 ms | ~22 MB |
+
+**YOLOv8n TFLite FP16** was selected as the primary model. At ~373 ms per inference pass, it leaves sufficient headroom within the overall latency budget for audio processing, frame grab, postprocessing, and serial command transmission. YOLOv8n at ~3–12 MB fits comfortably in the Pi Zero 2's 512 MB RAM alongside the OS, audio threads, and camera buffers.
+
+**YOLOv8s** (the "small" variant) was initially tested as it offers better detection accuracy (higher mAP on COCO), but its ~1069 ms inference time on the Pi Zero 2 via ONNX Runtime exceeds the latency budget on its own, before accounting for any other pipeline stage. Even at a reduced 320×320 input resolution (~680 ms), it consumes too much of the timing budget. YOLOv8s was retained as a tested alternative and its ONNX Runtime path remains in the codebase, but it is not used in the production configuration.
+
+#### 8.3.2 Runtime Selection: TFLite over ONNX Runtime
+
+Both TFLite Runtime and ONNX Runtime are supported in the codebase and were benchmarked:
+
+- **TFLite Runtime** — Optimised for ARM devices, supports FP16 and INT8 quantisation natively, and produces consistently lower inference latency on the Pi Zero 2's Cortex-A53. Uses NHWC tensor layout (no transpose needed). Requires Python 3.11 (resolved via pyenv).
+- **ONNX Runtime** — More portable and supports a wider range of models, but produces higher latency on the Pi Zero 2 for the same model architecture. Uses NCHW tensor layout (requires HWC→CHW transpose in preprocessing).
+
+TFLite was chosen as the default runtime because it delivers ~3× faster inference for YOLOv8n on the target hardware. ONNX Runtime remains available as a fallback (controlled by `use_tflite` in config) for models that are not available in TFLite format.
+
+#### 8.3.3 Input Resolution: 416×416
+
+The model input resolution of 416×416 was chosen as a balance between detection accuracy and inference speed. Smaller inputs (256×256, 320×320) speed up inference but reduce the effective resolution for detecting small birds at distance. Larger inputs (640×640) improve accuracy but push inference time well beyond the latency budget on the Pi Zero 2.
+
+At 416×416, the 1280×720 camera frame is letterboxed (resized with aspect ratio preservation and padded with value 114) to fit the square input. The letterbox parameters (scale factor, padding offsets) are tracked through postprocessing to correctly map bounding box coordinates back to the original frame.
+
+#### 8.3.4 SAHI (Sliced Aided Hyper Inference)
+
+For scenarios where birds appear very small in the frame (far distance or wide scene), BirdGuard supports SAHI-style tiled inference: the frame is split into a 2×2 grid of overlapping tiles, and inference is run on each tile independently. This effectively increases the resolution seen by the model at the cost of 4× the inference time.
+
+SAHI is disabled by default (`sahi_enabled: false`) because the 4× latency cost (~1.5 s total) exceeds the target budget for typical use. It is configurable at runtime via MQTT and includes an early-exit optimisation — if a bird is detected on any tile, remaining tiles are skipped. Overlapping detections across tile boundaries are merged via NMS.
+
+#### 8.3.5 Bird Class ID and Confidence Threshold
+
+The model uses COCO class ID 14 ("bird"). The confidence threshold is set deliberately low at 0.10 to favour recall over precision — in a deterrent system, a false positive (startling an empty area) is a low-cost event, while a false negative (missing a real bird) defeats the system's purpose. NMS with an IoU threshold of 0.50 suppresses duplicate detections.
+
+#### 8.3.6 Preprocessing Pipeline
+
+The image preprocessing pipeline follows the standard YOLOv8 input contract:
+
+1. **Letterbox resize** — Resize to 416×416 preserving aspect ratio, pad with value 114 (neutral grey).
+2. **Float32 normalisation** — Scale pixel values from [0, 255] to [0.0, 1.0].
+3. **Layout transpose** — For ONNX: HWC→CHW transpose + batch dimension (NCHW). For TFLite: batch dimension only (NHWC).
+4. **Postprocessing coordinate unscaling** — Bounding box coordinates are converted from model input space back to original frame pixel space by reversing the letterbox padding and scale, then normalised to [0, 1] relative to the original frame dimensions.
+
+An optional centre-crop mode (`centre_crop: true`) crops the 1280×720 frame to 720×720 before letterboxing. This removes the wide horizontal margins and better matches the model's square input aspect ratio, concentrating resolution on the centre of the scene.
+
+### 8.4 Architectural Design Choices
+
+#### 8.4.1 Two-Tier Edge Topology
+
+BirdGuard follows a deliberate two-tier architecture: the Pi Zero 2 W serves as the perception and decision node (all sensing, processing, and decision-making), while the Pico W serves as a deterministic actuator node (PWM and GPIO only). This separation exists because:
+
+1. **Real-time PWM** — Linux cannot guarantee microsecond-level PWM timing; the Pico W on bare metal can.
+2. **Failure isolation** — If the Pico W hangs, the Pi can detect it via serial timeout. If the Pi crashes, the turret holds its last position safely.
+3. **Simplicity** — The Pico firmware is a 50-line command parser. All intelligence lives in one place (the Pi).
+
+#### 8.4.2 Audio-Visual Fusion Pipeline
+
+The system uses a two-stage detection pipeline: audio first, then visual. Audio monitoring is computationally trivial and runs continuously, while visual inference is expensive and runs on-demand. The audio wake trigger activates the visual pipeline only when a potential acoustic event is detected, saving power and CPU cycles during quiet periods.
+
+When both audio bearing and visual detection are available, the visual bounding box takes priority because it is more precise. If visual detection fails (bird outside FOV, inference miss), the system falls back to the audio bearing and commands a sweep of the estimated zone. This fusion approach ensures the system responds to events it can hear but not yet see.
+
+#### 8.4.3 State Machine (Smart Patrol)
+
+The Smart Patrol mode operates as a four-state machine:
+
+- **IDLE** — Patrol sweep left-right-left, take snapshots at each waypoint, listen for audio wake events.
+- **SCANNING** — Audio wake received; slew to estimated bearing, take snapshots across ± scan angle to visually confirm bird presence.
+- **TRACKING** — Bird confirmed visually; run deterrent sweep, re-check with snapshots. If bird persists, repeat. If bird disappears for 2 consecutive misses, transition to SEARCHING.
+- **SEARCHING** — Bird lost; scan the area around the last known position. If found, return to TRACKING. If timeout (16 s), return to IDLE.
+
+This state machine ensures persistent deterrence (re-checking after sweeps) while avoiding infinite loops (timeout-based fallback to IDLE).
+
+#### 8.4.4 Privacy-by-Design
+
+All sensor data (camera frames, audio buffers) is processed entirely on-device. The only data that crosses a device boundary is the serial command to the Pico W (three numeric values: pan, tilt, laser state). If MQTT telemetry is enabled, only structured event metadata is transmitted (timestamp, event type, confidence score, pan/tilt angles) — never raw frames or audio. No raw imagery is stored to disk. This architecture ensures that bystanders captured by the camera are never exposed, meeting the privacy requirements for deployment in semi-public spaces.
+
+#### 8.4.5 End-to-End Latency
+
+The original design target was sub-500 ms end-to-end. Measured performance on the Pi Zero 2 W with YOLOv8n TFLite FP16 at 416×416 yields an end-to-end latency of approximately 2.1 seconds, which includes audio capture, TDOA computation, frame grab, inference (~373 ms), settle time (~400 ms per snapshot), postprocessing, and serial command. The settle time is necessary to avoid motion blur from servo vibration.
+
+This latency is contextualised against real-world bird behaviour: a bird arriving at a new perch typically takes 3–5 seconds to settle before committing to staying. The system's 2.1-second response falls within this window, delivering the deterrent stimulus before the bird has fully settled — which is the operationally relevant threshold.
+
+---
+
+## 9. Task Distribution
+
+The table below shows each team member's contributions across all BirdGuard deliverables. All members contributed to integration testing, debugging, and the final demo.
+
+### Abdul Azim Bin Mohd Said (2401980) — Team Lead / System Architect
+
+| Area | Contributions |
+|---|---|
+| System Architecture | Designed the two-tier edge topology (Pi Zero 2 W + Pico W), defined the threading model, and established the audio-visual fusion pipeline. Architected the multi-mode framework (Smart Patrol, Regular Patrol, Manual) with the ModeManager lifecycle and health monitoring system. |
+| Core Pipeline | Implemented the Smart Patrol state machine (IDLE → SCANNING → TRACKING → SEARCHING), the FrameGrabber background thread for eliminating stale-frame latency, decision fusion logic, and the deterrent sweep patterns (circular, Lissajous, random jitter). |
+| Inference & Model Integration | Integrated both TFLite and ONNX Runtime backends, implemented the letterbox preprocessing pipeline, coordinate unscaling in postprocessing, and SAHI tiled inference with early-exit and NMS merging. Resolved the double-normalisation bug in `_postprocess` and the TFLite Python 3.11 compatibility issue via pyenv. |
+| MQTT & Configuration | Built the full MQTT subsystem: config topic with runtime-tunable parameters, command topic with mode switching and restart logic, mode-specific command forwarding, telemetry publishing, and config persistence to disk. |
+| Health & Reliability | Implemented camera health monitoring with auto-fallback, turret health tracking, USB camera reconnection with multi-strategy device scanning, and graceful degradation across all failure scenarios. |
+| Profiling & Analysis | Wrote the `profile_smart_patrol.py` profiling suite with per-stage latency instrumentation, memory tracking, CSV export, matplotlib visualisations, and companion shell scripts for `cProfile`, `perf stat`, `perf record`, `taskset`, and `chrt`. |
+| Audio Diagnostics | Developed `diagnose_audio.py` — a six-test diagnostic tool covering ALSA enumeration, mixer settings, raw capture verification, BirdGuard pipeline simulation, turret-moving gate checks, and continuous RMS monitoring. |
+| Documentation | Authored the Design & Justification Report, the comprehensive README (setup guide, MQTT reference, design justifications), and the video presentation script. |
+
+### Amiirulhasan Bin Jumali (2400886)
+
+| Area | Contributions |
+|---|---|
+| Audio Pipeline | Implemented the AudioMonitor thread: ALSA capture via pyalsaaudio, RMS energy threshold detection, GCC-PHAT TDOA cross-correlation for bearing estimation, audio cooldown logic, and ALSA mixer initialisation at startup. Fixed the audio wake system bug where queue drain was mispositioned after settle sleep, and the `turret_moving` flag blocking the AudioMonitor thread during move windows. |
+| Pico W Firmware | Wrote the MicroPython firmware (`main.py`) for the Pico W: serial command parser, PWM servo control with angle-to-duty conversion, and laser GPIO control. Defined the serial protocol format. |
+| Hardware Assembly | Led physical assembly of the turret mechanism, wiring of servos and laser to the RoboPico board, and mounting of the camera on the pan/tilt assembly. |
+| Testing | Conducted audio pipeline testing with simulated bird sounds at known positions, measured TDOA accuracy, and tuned energy threshold and mixer gain values for the deployment environment. |
+
+### Qusyairie Dani Bin Qamarul Huda (2400922)
+
+| Area | Contributions |
+|---|---|
+| YOLO Model Pipeline | Handled model training, export, and quantisation: exported YOLOv8n and YOLOv8s from Ultralytics to ONNX format, performed INT8 quantisation, converted YOLOv8n to TFLite FP16, and benchmarked all model variants on the Pi Zero 2 W to establish the latency comparison data. |
+| Camera Integration | Implemented the shared camera subsystem: `_find_working_camera()` with multi-strategy device scanning (symlink, resolved path, `/dev/video*` scan, index fallback), `open_shared_camera()` with retry logic, and `grab_camera_frame()` with configurable stale-frame draining. Set up udev rules for stable device paths. |
+| Web Stream | Built the MJPEG streaming server using Flask, including the frame generator with placeholder rendering, the HTML viewer page, and integration with the `draw_overlay` function for live bounding box / state display. |
+| Regular Patrol Mode | Implemented `mode_patrol.py`: continuous sweep loop with configurable speed, pan bounds, tilt angle, and laser state; parallel streaming thread; and MQTT mode command handling for live parameter updates. |
+
+### Sim Yue Chong Samuel (2400695)
+
+| Area | Contributions |
+|---|---|
+| Manual Mode | Implemented `mode_manual.py`: user-controlled pan/tilt/laser via MQTT commands, immediate (non-interpolated) movement for responsive control, continuous camera streaming, and the background deterrent sweep trigger (`manual_deter`). |
+| Shared Infrastructure | Co-authored `shared.py`: the Config dataclass with all default values, `TUNABLE_FIELDS` set, config persistence loading, `ModeBase` abstract class with `start()`/`stop()`/`cmd()`/`smooth_move()`/`deterrent_sweep()`, and all shared state variables (queues, events, locks, position tracking). |
+| ReSpeaker HAT Setup | Handled the ReSpeaker 2-Mic HAT driver installation (seeed-voicecard), I2S configuration in `/boot/firmware/config.txt`, and audio mixer calibration. Documented the full audio setup procedure. |
+| Poster Design | Designed and produced the project poster for the final presentation, including system architecture diagrams, performance data visualisations, and the deployment scenario overview. |
+
+### Ng Jing Xiang Edson (2400677)
+
+| Area | Contributions |
+|---|---|
+| Pi Zero 2 W Setup | Led the initial Raspberry Pi Zero 2 W setup: OS flashing, SSH configuration, system package installation, Python 3.11 pyenv build (resolving tmpfs space and dependency issues), and pip package installation with NumPy <2.0 pinning. |
+| Turret Communication | Implemented `pico_turret.py`: serial connection management with auto-reconnect, health tracking via `is_healthy` flag, command formatting and encoding, and two-attempt write-with-retry logic. |
+| Network & MQTT Setup | Configured the Mosquitto MQTT broker on the Pi (systemd service, remote listener, anonymous access), verified local network connectivity, and tested MQTT round-trip with `mosquitto_pub`/`mosquitto_sub`. |
+| Video Presentation | Scripted and coordinated the ~11-minute five-speaker video presentation, including section allocation, timing, and narrative flow across all team members. |
 
 ---
 
