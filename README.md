@@ -779,12 +779,14 @@ Two model families were evaluated for the bird detection task, each tested in mu
 | Model | Format | Input Size | Inference Time (Pi Zero 2) | File Size |
 |---|---|---|---|---|
 | YOLOv8n | TFLite FP16 | 416×416 | ~373 ms | ~12 MB |
-| YOLOv8s | ONNX INT8 | 416×416 | ~1069 ms | ~22 MB |
-| YOLOv8s | ONNX INT8 | 320×320 | ~680 ms | ~22 MB |
+| YOLOv8n | TFLite INT8 | 416×416 | ~550 ms | ~11 MB |
+| YOLOv8s | ONNX FP32 | 320×320 | ~680 ms | ~22 MB |
+| YOLOv8s | ONNX FP32 | 416×416 | ~1500 ms | ~43 MB |
+| YOLOv8s | ONNX INT8 | 416×416 | ~1672 ms | ~11 MB |
 
 **YOLOv8n TFLite FP16** was selected as the primary model. At ~373 ms per inference pass, it leaves sufficient headroom within the overall latency budget for audio processing, frame grab, postprocessing, and serial command transmission. YOLOv8n at ~3–12 MB fits comfortably in the Pi Zero 2's 512 MB RAM alongside the OS, audio threads, and camera buffers.
 
-**YOLOv8s** (the "small" variant) was initially tested as it offers better detection accuracy (higher mAP on COCO), but its ~1069 ms inference time on the Pi Zero 2 via ONNX Runtime exceeds the latency budget on its own, before accounting for any other pipeline stage. Even at a reduced 320×320 input resolution (~680 ms), it consumes too much of the timing budget. YOLOv8s was retained as a tested alternative and its ONNX Runtime path remains in the codebase, but it is not used in the production configuration.
+**YOLOv8s** (the "small" variant) was initially tested as it offers better detection accuracy (higher mAP on COCO), but its ~1500 ms inference time on the Pi Zero 2 via ONNX Runtime exceeds the latency budget on its own, before accounting for any other pipeline stage. Even at a reduced 320×320 input resolution (~680 ms), it consumes too much of the timing budget. YOLOv8s was retained as a tested alternative and its ONNX Runtime path remains in the codebase, but it is not used in the production configuration.
 
 #### 8.3.2 Runtime Selection: TFLite over ONNX Runtime
 
@@ -834,7 +836,7 @@ BirdGuard follows a deliberate two-tier architecture: the Pi Zero 2 W serves as 
 
 #### 8.4.2 Audio-Visual Fusion Pipeline
 
-The system uses a two-stage detection pipeline: audio first, then visual. Audio monitoring is computationally trivial and runs continuously, while visual inference is expensive and runs on-demand. The audio wake trigger activates the visual pipeline only when a potential acoustic event is detected, saving power and CPU cycles during quiet periods.
+The system uses a two-stage detection pipeline: audio first, then visual. Audio monitoring is computationally trivial and runs continuously, while visual inference is expensive and runs on-demand. The audio wake trigger acts as a supplementary to the visual pipeline, directing scans towards the direction of a potential acoustic event when detected, saving power and CPU cycles during quiet periods.
 
 When both audio bearing and visual detection are available, the visual bounding box takes priority because it is more precise. If visual detection fails (bird outside FOV, inference miss), the system falls back to the audio bearing and commands a sweep of the estimated zone. This fusion approach ensures the system responds to events it can hear but not yet see.
 
@@ -855,9 +857,7 @@ All sensor data (camera frames, audio buffers) is processed entirely on-device. 
 
 #### 8.4.5 End-to-End Latency
 
-The original design target was sub-500 ms end-to-end. Measured performance on the Pi Zero 2 W with YOLOv8n TFLite FP16 at 416×416 yields an end-to-end latency of approximately 2.1 seconds, which includes audio capture, TDOA computation, frame grab, inference (~373 ms), settle time (~400 ms per snapshot), postprocessing, and serial command. The settle time is necessary to avoid motion blur from servo vibration.
-
-This latency is contextualised against real-world bird behaviour: a bird arriving at a new perch typically takes 3–5 seconds to settle before committing to staying. The system's 2.1-second response falls within this window, delivering the deterrent stimulus before the bird has fully settled — which is the operationally relevant threshold.
+The original design target was sub-500 ms end-to-end. Measured performance on the Pi Zero 2 W with YOLOv8n TFLite FP16 at 416×416 yields an end-to-end latency of approximately ~470 ms, which includes audio capture, TDOA computation, frame grab, inference (~373 ms), settle time, postprocessing, and serial command. The settle time is necessary to avoid motion blur from servo vibration.
 
 ---
 
@@ -884,7 +884,7 @@ The table below shows each team member's contributions across all BirdGuard deli
 |---|---|
 | Audio Pipeline | Implemented the AudioMonitor thread: ALSA capture via pyalsaaudio, RMS energy threshold detection, GCC-PHAT TDOA cross-correlation for bearing estimation, audio cooldown logic, and ALSA mixer initialisation at startup. Fixed the audio wake system bug where queue drain was mispositioned after settle sleep, and the `turret_moving` flag blocking the AudioMonitor thread during move windows. |
 | Pico W Firmware | Wrote the MicroPython firmware (`main.py`) for the Pico W: serial command parser, PWM servo control with angle-to-duty conversion, and laser GPIO control. Defined the serial protocol format. |
-| Hardware Assembly | Led physical assembly of the turret mechanism, wiring of servos and laser to the RoboPico board, and mounting of the camera on the pan/tilt assembly. |
+| Hardware Assembly | Led physical assembly of the turret mechanism, wiring of servos and laser to the RoboPico board, and mounting of the laser on the turret. |
 | Testing | Conducted audio pipeline testing with simulated bird sounds at known positions, measured TDOA accuracy, and tuned energy threshold and mixer gain values for the deployment environment. |
 
 ### Qusyairie Dani Bin Qamarul Huda (2400922)
@@ -926,5 +926,4 @@ The table below shows each team member's contributions across all BirdGuard deli
 | `/dev/birdguard_cam` exists but camera fails | The symlink may point to the metadata node (video1) instead of the capture node (video0). Re-check the udev rule includes `ATTR{index}=="0"` |
 | Turret spasms during patrol | `patrol_pan_min` is higher than `patrol_pan_max` — correct via MQTT `birdguard/mode` |
 | Audio triggers too easily | Raise `energy_threshold` via MQTT (try 600–1000); servo movement noise can self-trigger at low values |
-| Inference is too slow | Reduce `input_size` to 320/256 in config & use the appropriate yolo model with the same input dimensions |
 | `python --version` shows wrong version | Run `source ~/.bashrc` then `pyenv global 3.11.9` |
