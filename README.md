@@ -399,30 +399,39 @@ Fields are comma-separated, case-insensitive, and individually optional.
 
 ## 5. YOLO Model Setup
 
-Run these steps on your **laptop / desktop** (not the Pi).
+Run these steps on your **laptop / desktop** (not the Pi). You can perform these in a Colab Notebook.
 
 ### 5.1 Install Dependencies
 
 ```bash
-pip install ultralytics
-pip install onnxruntime onnx onnxruntime-tools
+!pip install ultralytics
 ```
 
-### 5.2 Export & Quantise the Model
+### 5.2 Export the Model
 
 ```bash
-python3 models/create_yolo_model.py
+from ultralytics import YOLO
+
+model = YOLO("yolov8n.pt")  # downloads automatically
+
+model.export(
+    format="tflite",
+    imgsz=416,
+    half=True,        # FP16
+    int8=False,       # not INT8 — FP16 is better on Cortex-A53
+    nms=False,        # keep postprocessing on the Pi side, same as current
+)
 ```
 
-This exports YOLOv8 to ONNX format at 416×416 input and quantises the weights to INT8 for faster inference on the Pi.
+This exports YOLOv8n to TFLite format at 416×416 input and quantises the weights to FP16 for faster inference on the Pi.
 
 ### 5.3 Transfer Model to Pi
 
 ```bash
-scp models/yolov8s_int8.onnx azimpi@<pi-ip>:~/birdguard/
+scp yolov8n_float16.tflite azimpi@<pi-ip>:~/birdguard/
 ```
 
-The default model path expected by BirdGuard is `yolov8s.onnx` inside the `birdguard/` directory. Update `model_path` in the config if using a different filename.
+The default model path expected by BirdGuard is set in `model_path` in the config. Change to the correct filename if using a different model.
 
 ---
 
@@ -437,7 +446,7 @@ cd ~/birdguard
 ### Basic Run
 
 ```bash
-python3 birdguard.py
+python birdguard.py
 ```
 
 Starts in **Smart Patrol** mode with no video stream overhead.
@@ -445,7 +454,7 @@ Starts in **Smart Patrol** mode with no video stream overhead.
 ### With Live Stream
 
 ```bash
-python3 birdguard.py --stream
+python birdguard.py --stream
 ```
 
 Serves an MJPEG live feed at `http://<pi-ip>:5000`. The feed includes bounding box overlays, current pan/tilt angles, and the active state.
@@ -453,13 +462,13 @@ Serves an MJPEG live feed at `http://<pi-ip>:5000`. The feed includes bounding b
 ### Custom Stream Port
 
 ```bash
-python3 birdguard.py --stream --port 8080
+python birdguard.py --stream --port 8080
 ```
 
 ### Disable MQTT
 
 ```bash
-python3 birdguard.py --no-mqtt
+python birdguard.py --no-mqtt
 ```
 
 ### Copy Files to Pi (from laptop)
@@ -778,9 +787,10 @@ Two model families were evaluated for the bird detection task, each tested in mu
 
 | Model | Format | Input Size | Inference Time (Pi Zero 2) | File Size |
 |---|---|---|---|---|
-| YOLOv8n | TFLite FP16 | 416×416 | ~373 ms | ~12 MB |
-| YOLOv8n | TFLite INT8 | 416×416 | ~550 ms | ~11 MB |
+| YOLOv8n | TFLite FP16 | 416×416 | ~373 ms | ~6 MB |
+| YOLOv8n | TFLite INT8 | 416×416 | ~550 ms | ~3 MB |
 | YOLOv8s | ONNX FP32 | 320×320 | ~680 ms | ~22 MB |
+| YOLOv8s | TFLite FP16 | 416×416 | ~1120 ms | ~21 MB |
 | YOLOv8s | ONNX FP32 | 416×416 | ~1500 ms | ~43 MB |
 | YOLOv8s | ONNX INT8 | 416×416 | ~1672 ms | ~11 MB |
 
